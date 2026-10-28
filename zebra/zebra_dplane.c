@@ -6811,7 +6811,8 @@ enum zebra_dplane_result dplane_rem_neigh_add(const struct interface *ifp,
 
 	result = neigh_update_internal(
 		DPLANE_OP_NEIGH_INSTALL, ifp, (const void *)mac, AF_ETHERNET,
-		ip, 0, flags, DPLANE_NUD_NOARP, update_flags, 0);
+		ip, 0, flags, DPLANE_NUD_NOARP | DPLANE_NUD_PERMANENT,
+		update_flags, 0);
 
 	return result;
 }
