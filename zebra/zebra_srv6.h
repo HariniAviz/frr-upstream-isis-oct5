@@ -52,6 +52,14 @@
 #define SRV6_SID_FORMAT_UNCOMPRESSED_F4024_EXPLICIT_RANGE_START 0xFF00
 #define SRV6_SID_FORMAT_UNCOMPRESSED_F4024_FUNC_UNRESERVED_MIN	0x40
 
+/*
+ * For a no-named-format locator, functions below this value are reserved
+ * for VRF-level services (End.DT4/DT6/DT46); per-EVI services (End.DT2U/
+ * DT2M/DX2, etc.) are allocated starting from this value. See the comment
+ * on zebra_srv6_sid_block.u.uncompressed.first_available_vrf_func.
+ */
+#define SRV6_SID_NOFORMAT_EVI_FUNC_BASE 1000
+
 /* uSID Wide LIB */
 struct wide_lib {
 	uint32_t func;
@@ -114,6 +122,32 @@ struct zebra_srv6_sid_block {
 			uint32_t first_available_func;
 			struct list *func_allocated;
 			struct list *func_released;
+
+			/*
+			 * Separate reserved counter/lists for VRF-level
+			 * services (End.DT4/DT6/DT46, e.g. "sid vpn per-vrf
+			 * export auto"). Only used when this block has no
+			 * named sid_format (the plain "locator NAME / prefix
+			 * .../block-len .../..." case) - the format-based
+			 * branches already have their own explicit/dynamic
+			 * range split and are unaffected.
+			 *
+			 * Without this split, a VRF-level SID request (from
+			 * bgpd, over zapi) and a per-EVI SID request
+			 * (zebra-internal, from processing "l2-evpn evi ...")
+			 * race for the same first_available_func counter:
+			 * whichever reaches the allocator first claims the
+			 * lower index, so the VRF's End.DT46 SID ends up at
+			 * an unpredictable, run-to-run-inconsistent function
+			 * number. Reserving functions
+			 * [1, SRV6_SID_NOFORMAT_EVI_FUNC_BASE) for VRF-level
+			 * services and starting per-EVI allocation from
+			 * SRV6_SID_NOFORMAT_EVI_FUNC_BASE makes the two pools
+			 * non-overlapping, so allocation order can no longer
+			 * change which pool a SID lands in.
+			 */
+			uint32_t first_available_vrf_func;
+			struct list *vrf_func_released;
 		} uncompressed;
 	} u;
 
