@@ -6263,9 +6263,27 @@ bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct strea
 				+ BGP_ATTR_MIN_LEN
 				+ BGP_PREFIX_SID_SRV6_L3_SERVICE_SID_INFO_LENGTH;
 			uint8_t tlv_len = subtlv_len + BGP_ATTR_MIN_LEN + 1;
-			uint8_t attr_len = tlv_len + BGP_ATTR_MIN_LEN;
+			/* For EVPN MAC+IP routes, combine L3 and L2 SIDs into a
+			 * single PREFIX_SID attribute (RFC 9252).  Two separate
+			 * PREFIX_SID attributes in one UPDATE are rejected by the
+			 * duplicate-attribute check (RFC 7606 section 3g). */
+			struct bgp_attr_srv6_l3service *srv6_l2vpn_combined = NULL;
+			uint8_t subtlv_len_l2 = 0, tlv_len_l2 = 0;
+			uint8_t attr_len;
+
+			if (afi == AFI_L2VPN && safi == SAFI_EVPN && bgp_attr_get_srv6_l2vpn(attr)) {
+				srv6_l2vpn_combined = bgp_attr_get_srv6_l2vpn(attr);
+				subtlv_len_l2 = BGP_PREFIX_SID_SRV6_L2_SERVICE_SID_STRUCTURE_LENGTH
+						+ BGP_ATTR_MIN_LEN
+						+ BGP_PREFIX_SID_SRV6_L2_SERVICE_SID_INFO_LENGTH;
+				tlv_len_l2 = subtlv_len_l2 + BGP_ATTR_MIN_LEN + 1;
+				attr_len = (tlv_len + BGP_ATTR_MIN_LEN) + (tlv_len_l2 + BGP_ATTR_MIN_LEN);
+			} else {
+				attr_len = tlv_len + BGP_ATTR_MIN_LEN;
+			}
+
 			stream_putc(s, BGP_ATTR_FLAG_OPTIONAL | BGP_ATTR_FLAG_TRANS |
-					       bgp_attr_partial(attr, BGP_ATTR_PREFIX_SID));
+				       bgp_attr_partial(attr, BGP_ATTR_PREFIX_SID));
 			stream_putc(s, BGP_ATTR_PREFIX_SID);
 			stream_putc(s, attr_len);
 			stream_putc(s, BGP_PREFIX_SID_SRV6_L3_SERVICE);
@@ -6290,6 +6308,30 @@ bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct strea
 			stream_putc(s, srv6_l3service->arg_len);
 			stream_putc(s, srv6_l3service->transposition_len);
 			stream_putc(s, srv6_l3service->transposition_offset);
+
+			/* For EVPN MAC+IP IRB: append L2 SID TLV in the same
+			 * PREFIX_SID attribute, per RFC 9252 section 5.1. */
+			if (srv6_l2vpn_combined) {
+				stream_putc(s, BGP_PREFIX_SID_SRV6_L2_SERVICE);
+				stream_putw(s, tlv_len_l2);
+				stream_putc(s, 0); /* reserved */
+				stream_putc(s, BGP_PREFIX_SID_SRV6_L2_SERVICE_SID_INFO);
+				stream_putw(s, subtlv_len_l2);
+				stream_putc(s, 0); /* reserved */
+				stream_put(s, &srv6_l2vpn_combined->sid,
+					   sizeof(srv6_l2vpn_combined->sid));
+				stream_putc(s, 0); /* sid_flags */
+				stream_putw(s, srv6_l2vpn_combined->endpoint_behavior);
+				stream_putc(s, 0); /* reserved */
+				stream_putc(s, BGP_PREFIX_SID_SRV6_L2_SERVICE_SID_STRUCTURE);
+				stream_putw(s, BGP_PREFIX_SID_SRV6_L2_SERVICE_SID_STRUCTURE_LENGTH);
+				stream_putc(s, srv6_l2vpn_combined->loc_block_len);
+				stream_putc(s, srv6_l2vpn_combined->loc_node_len);
+				stream_putc(s, srv6_l2vpn_combined->func_len);
+				stream_putc(s, srv6_l2vpn_combined->arg_len);
+				stream_putc(s, srv6_l2vpn_combined->transposition_len);
+				stream_putc(s, srv6_l2vpn_combined->transposition_offset);
+			}
 		} else if (bgp_attr_get_srv6_vpn(attr)) {
 			struct bgp_attr_srv6_vpn *vpn = bgp_attr_get_srv6_vpn(attr);
 
@@ -6306,8 +6348,10 @@ bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer, struct strea
 		}
 	}
 
-	/* SRv6 L2 Service Information Attribute (RFC 9252) for EVPN. */
-	if (afi == AFI_L2VPN && safi == SAFI_EVPN && bgp_attr_get_srv6_l2vpn(attr)) {
+	/* SRv6 L2 Service Information Attribute (RFC 9252) for EVPN.
+	 * Only emit as standalone when there is no L3 SID; if both are present
+	 * the L2 sub-TLV was already appended inside the L3 PREFIX_SID block. */
+	if (afi == AFI_L2VPN && safi == SAFI_EVPN && bgp_attr_get_srv6_l2vpn(attr) && !bgp_attr_get_srv6_l3service(attr)) {
 		struct bgp_attr_srv6_l3service *srv6_l2vpn = bgp_attr_get_srv6_l2vpn(attr);
 		uint8_t subtlv_len = BGP_PREFIX_SID_SRV6_L2_SERVICE_SID_STRUCTURE_LENGTH +
 				     BGP_ATTR_MIN_LEN +
