@@ -1402,6 +1402,20 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 
 		is_parent_evpn = is_route_parent_evpn(mpinfo);
 
+		/*
+		 * SRv6 VRF IRB: Type-2 MAC+IP route imported from EVPN table
+		 * into a VRF with SRv6 L3 service.  The parent is EVPN but we
+		 * must install using SRv6 encap (not MPLS/EVPN-label path),
+		 * so clear is_parent_evpn to let the SRv6 nexthop block fire.
+		 */
+		struct bgp_attr_srv6_l3service *srv6_l3service_irb =
+			bgp_attr_get_srv6_l3service(mpinfo_cp->attr);
+		bool is_srv6_vrf_irb =
+			is_parent_evpn && srv6_l3service_irb &&
+			!IN6_IS_ADDR_UNSPECIFIED(&srv6_l3service_irb->sid);
+		if (is_srv6_vrf_irb)
+			is_parent_evpn = false;
+
 		if (nh_family == AF_INET) {
 			nh_updated = update_ipv4nh_for_route_install(
 				nh_othervrf, bgp_orig,
@@ -1426,6 +1440,11 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 					mpinfo, info, is_parent_evpn, api_nh);
 		}
 
+		/* SRv6 VRF IRB: the SID nexthop lives in the default VRF's
+		 * IPv6 table, not in the tenant VRF -- force resolution there. */
+		if (is_srv6_vrf_irb)
+			api_nh->vrf_id = VRF_DEFAULT;
+
 		is_evpn = !!CHECK_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_EVPN);
 		bre = bgp_attr_get_evpn_overlay(mpinfo->attr);
 
@@ -1444,6 +1463,19 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 
 		num_labels = BGP_PATH_INFO_NUM_LABELS(mpinfo);
 		labels = num_labels ? mpinfo->extra->labels->label : NULL;
+
+		/* SRv6 VRF IRB: normally suppress MPLS/EVPN label — SRv6 encap
+		 * carries the forwarding instruction via seg6_segs below.
+		 * Exception: when the attached SID uses the RFC 9252 §4
+		 * transposition scheme (transposition_len != 0), the label
+		 * field is where the transposed function bits live — it must
+		 * survive so the transpose_sid() reconstruction below can run,
+		 * otherwise the SID we install into our own kernel FIB would
+		 * silently be missing its function bits. */
+		if (is_srv6_vrf_irb && srv6_l3service_irb->transposition_len == 0) {
+			num_labels = 0;
+			labels = NULL;
+		}
 
 		if (num_labels && (is_evpn || bgp_is_valid_label(&labels[0]))) {
 			enum lsp_types_t nh_label_type = ZEBRA_LSP_NONE;
@@ -1496,10 +1528,21 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 			       sizeof(api_nh->seg6_segs[0]));
 			api_nh->srv6_encap_behavior = bgp_orig->srv6_encap_behavior;
 
-			if (srv6_l3service && labels && (num_labels > 0) &&
-			    bgp_is_valid_label(&labels[0]) &&
+			/* The L3 Service TLV's transposed function travels in
+			 * the L3 label slot, which bgp_evpn_path_info_labels_get_l3vni()
+			 * already defines for this codebase: the last label.
+			 * Type-5 and plain VPN carry one label, so that is
+			 * label[0]; a Type-2 carries two and label[0] is the
+			 * mandatory L2/EVI label, so the function is in
+			 * label[1]. Reading label[0] unconditionally would
+			 * splice the EVI label into the SID as if it were
+			 * function bits. */
+			mpls_label_t *l3_label_slot =
+				bgp_evpn_path_info_labels_get_l3vni(labels, num_labels);
+
+			if (srv6_l3service && l3_label_slot && bgp_is_valid_label(l3_label_slot) &&
 			    srv6_l3service->transposition_len != 0) {
-				mpls_lse_decode(labels[0], &nh_label, &ttl,
+				mpls_lse_decode(*l3_label_slot, &nh_label, &ttl,
 						&exp, &bos);
 
 				if (nh_label < MPLS_LABEL_UNRESERVED_MIN) {
