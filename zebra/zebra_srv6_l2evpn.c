@@ -24,6 +24,7 @@
 #include "zebra/zebra_evpn.h"
 #include "zebra/zebra_evpn_mac.h"
 #include "zebra/zebra_evpn_neigh.h"
+#include "lib/zclient.h"
 #include "zebra/zebra_sr6.h"
 #include "zebra/zebra_dplane.h"
 #include "zebra/interface.h"
@@ -1128,21 +1129,54 @@ void zebra_srv6_evi_realize(struct zebra_srv6_evi *evi)
 	SET_FLAG(zevpn->flags, ZEVPN_READY_FOR_BGP);
 	zebra_evpn_send_add_to_client(zevpn);
 
+	/* RFC 9135 section 9: Anycast Gateway advertisement.
+	 * For IRB-enabled EVIs (VRF binding present), (re)register the bridge
+	 * SVI MAC+IP as the local gateway entry so it's ready to advertise as
+	 * a sticky Default GW Type-2 route.  Whether it actually gets sent to
+	 * bgpd is gated by the existing advertise-default-gw knob (checked via
+	 * advertise_gw_macip_enabled() inside zebra_evpn_{mac,neigh}_gw_macip_add()) -
+	 * same knob/CLI/ZAPI plumbing already used by the VXLAN path, so it is
+	 * NOT force-enabled here.  This allows remote PEs to suppress ARP/ND
+	 * for the gateway IP and enables seamless CE mobility without
+	 * re-ARPing, when the operator has opted in.  The MACIP send is
+	 * idempotent -- it overwrites any stale entry with fresh SID-embedded
+	 * attributes. */
+	if (evi->vrf_id != VRF_DEFAULT && evi->bridge_if)
+		zebra_srv6_evpn_gw_macip_add(evi->bridge_if, zevpn);
+
 	/*
-	 * Re-scan the kernel bridge FDB for this EVI's bridge + VLAN so local
-	 * MACs already present in the kernel are originated as Type-2.  Local
-	 * MACs (static FDB entries, or MACs learned before an EVI delete/re-add)
-	 * emit their RTM_NEWNEIGH only once — on a re-add zebra never sees them
-	 * again, so without this rescan a re-added SRv6 EVI never advertises
-	 * its pre-existing local MACs (and peers never build the unicast sr6).
-	 * Mirrors the VXLAN VNI-up path (zebra_evpn_read_mac_neigh).  vid 0
-	 * (vlan-bundle) means no VLAN filter — read the whole bridge FDB.
+	 * Re-scan the kernel bridge FDB *and* neighbor table for this EVI's
+	 * bridge + VLAN so local MACs and ARP/ND entries already present in
+	 * the kernel are (re-)originated as Type-2. Both emit their
+	 * RTM_NEWNEIGH only once -- on zebra restart, or an EVI delete/re-add,
+	 * zebra never sees an already-established kernel entry again, so
+	 * without this rescan a (re-)realized SRv6 EVI silently drops any
+	 * pre-existing local host's MAC+IP route (the plain MAC-only route
+	 * still gets re-learned once new traffic arrives, masking this as a
+	 * "partial" loss rather than the missing neighbor rescan it is).
+	 * Mirrors the VXLAN VNI-up path (zebra_evpn_read_mac_neigh(), which
+	 * calls both dplane_fdb_read_for_bridge() and
+	 * dplane_neigh_read_for_vlan() together) - this EVI-realize path only
+	 * ever had the FDB half. vid 0 (vlan-bundle) means no VLAN filter -
+	 * read the whole bridge FDB. The EVI's bridge itself (not a separate
+	 * VLAN sub-interface) is where the SVI IP/ARP lives here, so it is
+	 * also the neighbor-read's "vlan interface".
+	 *
+	 * realize() itself runs far more often than the bridge actually
+	 * changes (every remote MAC install, VLAN repair, interface-add hook,
+	 * ...); re-issuing a full kernel FDB+neighbor dump request on every
+	 * one of those redundant calls floods the dataplane instead of
+	 * helping, so only do this once per bridge (tracked by ifindex, reset
+	 * whenever the bridge actually changes).
 	 */
-	{
+	if (evi->kernel_state_rescan_bridge_ifindex != evi->bridge_if->ifindex) {
 		struct zebra_ns *zns = zebra_ns_lookup(NS_DEFAULT);
 
-		if (zns)
+		if (zns) {
 			dplane_fdb_read_for_bridge(zns, evi->bridge_if, evi->bridge_if, zevpn->vid);
+			dplane_neigh_read_for_vlan(zns, evi->bridge_if);
+			evi->kernel_state_rescan_bridge_ifindex = evi->bridge_if->ifindex;
+		}
 	}
 
 	if (IS_ZEBRA_DEBUG_VXLAN)
@@ -1203,6 +1237,24 @@ vni_t zebra_srv6_evi_vni_by_bridge_vlan(const struct interface *br_if, vlanid_t 
 	return found;
 }
 
+/* Find the first SRv6 EVI whose bridge_if matches br_if.
+ * Used by zebra_evpn_from_svi() to resolve ARP/ND events on SRv6 bridges. */
+struct zebra_srv6_evi *
+zebra_srv6_evi_find_by_bridge(const struct interface *br_if)
+{
+	struct zebra_srv6_evi *evi;
+
+	if (!br_if)
+		return NULL;
+
+	frr_each (srv6_evi_htab, srv6_evi_table, evi) {
+		if (evi->bridge_if == br_if)
+			return evi;
+	}
+
+	return NULL;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Replay all SRv6 EVIs to BGP                                                  */
 /* -------------------------------------------------------------------------- */
@@ -1222,8 +1274,23 @@ void zebra_srv6_l2evpn_replay(void)
 	if (!srv6_evi_inited)
 		return;
 
-	frr_each_safe (srv6_evi_htab, srv6_evi_table, evi)
+	frr_each_safe (srv6_evi_htab, srv6_evi_table, evi) {
+		/*
+		 * Force the kernel FDB/neighbor rescan inside realize() below,
+		 * even though this bridge may already have been rescanned once
+		 * before. This replay path runs specifically when bgpd
+		 * (re)enables advertise-all-vni - most commonly after a
+		 * bgpd-only restart while zebra keeps running - and existing
+		 * local MACs/neighbors need to be re-originated as Type-2 to
+		 * the newly (re)connected bgp client even though zebra's own
+		 * bridge state never changed. The per-bridge gate in realize()
+		 * only knows how to suppress *its own* redundant calls; it has
+		 * no way to tell that the client on the other end just lost
+		 * all of its EVPN state.
+		 */
+		evi->kernel_state_rescan_bridge_ifindex = 0;
 		zebra_srv6_evi_realize(evi);
+	}
 }
 
 /* -------------------------------------------------------------------------- */
